@@ -1,20 +1,19 @@
 import asyncio
 import logging
 import resource
+import os
 from datetime import datetime, date
 
 import pandas as pd
 import ccxt
-from aiogram import Bot, Dispatcher, types
+import aiosqlite
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram import F
-import aiosqlite
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp_socks import ProxyConnector  # Для обхода Connection Reset
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-# Для .env
 from dotenv import load_dotenv
-import os
 
 # ====================== НАСТРОЙКИ ДЛЯ MACOS ======================
 try:
@@ -33,14 +32,18 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 if not TOKEN:
     raise ValueError("❌ TELEGRAM_TOKEN не найден в .env файле!")
 
-if not ADMIN_ID:
-    print("⚠️ ADMIN_ID не указан — команда /test_signal будет недоступна")
-
 db_path = "signals.db"
-# ============================================================
 
-bot = Bot(token=TOKEN)
+# --- НАСТРОЙКА ПРОКСИ (ДЛЯ ОБХОДА CONNECTION RESET) ---
+# Если у вас есть конкретный прокси, расскомментируйте строку ниже и вставьте данные:
+# connector = ProxyConnector.from_url('socks5://user:pass@host:port')
+# session = AiohttpSession(connector=connector)
+
+# Если используете системный VPN, оставляем так:
+session = AiohttpSession()
+bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher()
+
 
 # ====================== БАЗА ДАННЫХ ======================
 async def init_db():
@@ -69,6 +72,7 @@ async def init_db():
         ''')
         await db.commit()
 
+
 # ====================== ПОДПИСЧИКИ ======================
 async def add_subscriber(user: types.User):
     async with aiosqlite.connect(db_path) as db:
@@ -78,23 +82,27 @@ async def add_subscriber(user: types.User):
         ''', (user.id, user.username, user.first_name, datetime.now().isoformat()))
         await db.commit()
 
+
 async def remove_subscriber(user_id: int):
     async with aiosqlite.connect(db_path) as db:
         await db.execute("DELETE FROM subscribers WHERE user_id = ?", (user_id,))
         await db.commit()
+
 
 async def get_all_subscribers():
     async with aiosqlite.connect(db_path) as db:
         rows = await db.execute_fetchall("SELECT user_id FROM subscribers")
         return [row[0] for row in rows]
 
+
 async def broadcast_message(text: str, parse_mode="HTML"):
     subscribers = await get_all_subscribers()
     for user_id in subscribers:
         try:
             await bot.send_message(user_id, text, parse_mode=parse_mode, disable_web_page_preview=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Ошибка отправки пользователю {user_id}: {e}")
+
 
 # ====================== ОТПРАВКА СИГНАЛА ======================
 async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
@@ -104,7 +112,10 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
             VALUES (?, ?, ?, ?, ?, ?, 'open', 'temp')
         ''', (pair, direction, entry_price, tp, sl, datetime.now().isoformat()))
         await db.commit()
-        signal_id = (await db.execute("SELECT last_insert_rowid()")).fetchone()[0]
+
+        cursor = await db.execute("SELECT last_insert_rowid()")
+        row = await cursor.fetchone()
+        signal_id = row[0]
 
     hashtag = f"SIG_{signal_id:04d}"
 
@@ -127,6 +138,7 @@ Stop Loss: <b>{sl:.2f} USDT</b>
 
     await broadcast_message(text)
 
+
 # ====================== ИСТОРИЯ ======================
 async def get_history(limit: int = 30):
     async with aiosqlite.connect(db_path) as db:
@@ -134,17 +146,21 @@ async def get_history(limit: int = 30):
             SELECT * FROM signals ORDER BY id DESC LIMIT ?
         """, (limit,))
 
+
 # ====================== ГЕНЕРАЦИЯ СИГНАЛОВ ======================
 async def generate_signals():
     today_str = date.today().isoformat()
     async with aiosqlite.connect(db_path) as db:
-        count = (await db.execute("SELECT COUNT(*) FROM signals WHERE timestamp LIKE ?", (f"{today_str}%",))).fetchone()[0]
-        if count >= 3:
+        cursor = await db.execute("SELECT COUNT(*) FROM signals WHERE timestamp LIKE ?", (f"{today_str}%",))
+        row = await cursor.fetchone()
+        if row[0] >= 3:
             return
 
     for pair in ["BTC/USDT", "ETH/USDT"]:
         async with aiosqlite.connect(db_path) as db:
-            last = await db.execute_fetchone("SELECT timestamp FROM signals WHERE pair = ? ORDER BY id DESC LIMIT 1", (pair,))
+            cursor = await db.execute("SELECT timestamp FROM signals WHERE pair = ? ORDER BY id DESC LIMIT 1", (pair,))
+            last = await cursor.fetchone()
+
         if last and (datetime.now() - datetime.fromisoformat(last[0])).total_seconds() < 14400:
             continue
 
@@ -177,6 +193,7 @@ async def generate_signals():
         except Exception as e:
             logging.error(f"Ошибка генерации {pair}: {e}")
 
+
 # ====================== МОНИТОРИНГ TP/SL ======================
 async def monitor_open_signals():
     async with aiosqlite.connect(db_path) as db:
@@ -188,7 +205,8 @@ async def monitor_open_signals():
         signal_id, pair, direction, tp, sl, hashtag = row
         try:
             exchange = ccxt.binance({'enableRateLimit': True})
-            current_price = exchange.fetch_ticker(pair)['last']
+            ticker = exchange.fetch_ticker(pair)
+            current_price = ticker['last']
 
             closed = False
             status = None
@@ -210,7 +228,7 @@ async def monitor_open_signals():
             if closed:
                 async with aiosqlite.connect(db_path) as db:
                     await db.execute("UPDATE signals SET status = ?, close_price = ? WHERE id = ?",
-                                   (status, current_price, signal_id))
+                                     (status, current_price, signal_id))
                     await db.commit()
 
                 status_text = "✅ Take Profit" if status == "closed_tp" else "❌ Stop Loss"
@@ -218,6 +236,7 @@ async def monitor_open_signals():
                 await broadcast_message(text)
         except Exception as e:
             logging.error(f"Ошибка мониторинга #{hashtag}: {e}")
+
 
 # ====================== ХЭНДЛЕРЫ ======================
 @dp.message(Command("start"))
@@ -232,13 +251,12 @@ async def start_cmd(message: types.Message):
     )
     await message.answer(
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-        "✅ Ты успешно подписан на торговые сигналы по BTC/USDT и ETH/USDT.\n"
-        "• 1–3 сигнала в день\n"
-        "• С Take Profit и Stop Loss\n\n"
+        "✅ Ты успешно подписан на торговые сигналы.\n"
         "Используй кнопки ниже.",
         parse_mode="HTML",
         reply_markup=keyboard
     )
+
 
 @dp.message(F.text == "📜 История сигналов")
 async def show_history(message: types.Message):
@@ -262,11 +280,13 @@ async def show_history(message: types.Message):
         text += line
     await message.answer(text, parse_mode="HTML")
 
+
 @dp.message(F.text == "❌ Отписаться от сигналов")
 async def unsubscribe(message: types.Message):
     await remove_subscriber(message.from_user.id)
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ Подписаться на сигналы")]], resize_keyboard=True)
     await message.answer("❌ Ты отписался.", reply_markup=kb)
+
 
 @dp.message(F.text == "✅ Подписаться на сигналы")
 async def subscribe_again(message: types.Message):
@@ -277,6 +297,7 @@ async def subscribe_again(message: types.Message):
     )
     await message.answer("✅ Ты снова подписан!", reply_markup=kb)
 
+
 @dp.message(Command("test_signal"))
 async def test_signal(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -284,9 +305,8 @@ async def test_signal(message: types.Message):
         return
     await message.answer("🧪 Отправляю тестовые сигналы...")
     await send_signal("BTC/USDT", "LONG", 65234.5, 66865.0, 63929.8)
-    await asyncio.sleep(2)
-    await send_signal("ETH/USDT", "SHORT", 3245.6, 3164.0, 3300.0)
-    await message.answer("✅ Тестовые сигналы отправлены всем подписчикам.")
+    await message.answer("✅ Тестовые сигналы отправлены.")
+
 
 # ====================== ЗАПУСК ======================
 async def main():
@@ -299,7 +319,15 @@ async def main():
     scheduler.start()
 
     print("🚀 Бот успешно запущен! Напиши ему /start в Telegram.")
-    await dp.start_polling(bot)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Бот остановлен")
