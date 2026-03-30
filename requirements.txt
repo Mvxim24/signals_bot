@@ -1,0 +1,7 @@
+aiogram
+aiosqlite
+apscheduler
+pandas
+ccxt
+python-dotenv
+aiohttp-socks
