@@ -18,9 +18,9 @@ from dotenv import load_dotenv
 try:
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (524288, hard))
-    print(f"✅ Лимит открытых файлов увеличен: {soft} → 524288")
-except Exception as e:
-    print(f"⚠️ Не удалось увеличить лимит файлов: {e}")
+    print(f"✅ Лимит открытых файлов увеличен")
+except Exception:
+    pass
 
 # ========================= НАСТРОЙКИ =========================
 load_dotenv()
@@ -99,16 +99,15 @@ async def broadcast_message(text: str, parse_mode="HTML"):
             logging.error(f"Ошибка отправки пользователю {user_id}: {e}")
 
 
-# ====================== ИСТОРИЯ СИГНАЛОВ ======================
+# ====================== ИСТОРИЯ ======================
 async def get_history(limit: int = 30):
-    """Получить последние сигналы"""
     async with aiosqlite.connect(db_path) as db:
         return await db.execute_fetchall("""
             SELECT * FROM signals ORDER BY id DESC LIMIT ?
         """, (limit,))
 
 
-# ====================== ОТПРАВКА СИГНАЛА ======================
+# ====================== ОТПРАВКА СИГНАЛА (КРАСИВО) ======================
 async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
     async with aiosqlite.connect(db_path) as db:
         await db.execute('''
@@ -123,50 +122,35 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
 
     hashtag = f"SIG_{signal_id:04d}"
 
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("UPDATE signals SET hashtag = ? WHERE id = ?", (hashtag, signal_id))
-        await db.commit()
-
     emoji = "📈" if direction == "LONG" else "📉"
-    text = f"""🚨 <b>Новый торговый сигнал #{hashtag}</b>
+    direction_text = "LONG" if direction == "LONG" else "SHORT"
 
-Пара: <b>{pair}</b>
-Направление: <b>{direction} {emoji}</b>
-Цена входа: <b>~{entry_price:.2f} USDT</b>
-Take Profit: <b>{tp:.2f} USDT</b>
-Stop Loss: <b>{sl:.2f} USDT</b>
+    text = f"""🚨 <b>НОВЫЙ ТОРГОВЫЙ СИГНАЛ #{hashtag}</b>
 
-Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}
+{emoji} <b>{pair}</b> — <b>{direction_text}</b> {emoji}
 
-Поиск: <b>#{hashtag}</b>"""
+💰 <b>Цена входа:</b> <code>{entry_price:.2f} USDT</code>
+🎯 <b>Take Profit:</b> <code>{tp:.2f} USDT</code>
+🛑 <b>Stop Loss:</b> <code>{sl:.2f} USDT</code>
+
+🕒 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}
+
+🔍 <b>#{hashtag}</b>"""
 
     await broadcast_message(text)
+    print(f"✅ Сигнал отправлен → {pair} | {direction} | {entry_price:.2f}")
 
 
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ ======================
+# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (БЕЗ ЛИМИТОВ + КРАСИВО) ======================
 async def generate_signals():
-    today_str = date.today().isoformat()
-    async with aiosqlite.connect(db_path) as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM signals WHERE timestamp LIKE ?", (f"{today_str}%",))
-        row = await cursor.fetchone()
-        if row and row[0] >= 3:
-            return
+    print(f"\n🔄 [{datetime.now().strftime('%H:%M:%S')}] Запуск генерации сигналов...")
 
     for pair in ["BTC/USDT", "ETH/USDT"]:
         try:
-            async with aiosqlite.connect(db_path) as db:
-                cursor = await db.execute(
-                    "SELECT timestamp FROM signals WHERE pair = ? ORDER BY id DESC LIMIT 1", 
-                    (pair,)
-                )
-                last = await cursor.fetchone()
-
-            if last and (datetime.now() - datetime.fromisoformat(last[0])).total_seconds() < 14400:
-                continue
-
             exchange = ccxt.binance({'enableRateLimit': True})
             ohlcv = exchange.fetch_ohlcv(pair, '1h', limit=100)
             df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+            
             df['sma20'] = df['close'].rolling(20).mean()
             df['sma50'] = df['close'].rolling(50).mean()
 
@@ -175,23 +159,33 @@ async def generate_signals():
             price = curr['close']
 
             if pd.isna(curr.get('sma20')) or pd.isna(curr.get('sma50')):
+                print(f"   ⚠️  Недостаточно данных для {pair}")
                 continue
 
             direction = None
+            sl = None
+            tp = None
+
             if curr['sma20'] > curr['sma50'] and prev['sma20'] <= prev['sma50']:
                 direction = "LONG"
-                sl = price * 0.985
-                tp = price * 1.03
+                sl = round(price * 0.985, 2)
+                tp = round(price * 1.03, 2)
             elif curr['sma20'] < curr['sma50'] and prev['sma20'] >= prev['sma50']:
                 direction = "SHORT"
-                sl = price * 1.015
-                tp = price * 0.97
+                sl = round(price * 1.015, 2)
+                tp = round(price * 0.97, 2)
 
             if direction:
+                print(f"   🎯 Найден сигнал: {direction} | {pair} | Цена: {price:.2f}")
                 await send_signal(pair, direction, price, tp, sl)
+            else:
+                print(f"   ❌ Нет сигнала по {pair}")
 
         except Exception as e:
             logging.error(f"Ошибка генерации {pair}: {e}")
+            print(f"   ❌ Ошибка при анализе {pair}: {e}")
+
+    print(f"✅ Генерация сигналов завершена [{datetime.now().strftime('%H:%M:%S')}]\n")
 
 
 # ====================== МОНИТОРИНГ TP/SL ======================
@@ -210,6 +204,7 @@ async def monitor_open_signals():
 
             closed = False
             status = None
+
             if direction == "LONG":
                 if current_price >= tp:
                     status = "closed_tp"
@@ -231,9 +226,14 @@ async def monitor_open_signals():
                                      (status, current_price, signal_id))
                     await db.commit()
 
-                status_text = "✅ Take Profit" if status == "closed_tp" else "❌ Stop Loss"
-                text = f"📢 <b>Сигнал закрыт #{hashtag}</b>\nСтатус: <b>{status_text}</b>\nЦена: <b>{current_price:.2f} USDT</b>"
+                status_text = "✅ TAKE PROFIT" if status == "closed_tp" else "❌ STOP LOSS"
+                text = f"""📢 <b>Сигнал закрыт #{hashtag}</b>
+
+{status_text}
+Цена закрытия: <b>{current_price:.2f} USDT</b>"""
+
                 await broadcast_message(text)
+                print(f"📌 Сигнал закрыт: #{hashtag} → {status_text}")
         except Exception as e:
             logging.error(f"Ошибка мониторинга #{hashtag}: {e}")
 
@@ -245,14 +245,14 @@ async def start_cmd(message: types.Message):
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📜 История сигналов")],
-            [KeyboardButton(text="❌ Отписаться от сигналов")]
+            [KeyboardButton(text="❌ Отписаться")]
         ],
         resize_keyboard=True
     )
     await message.answer(
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-        "✅ Ты успешно подписан на торговые сигналы.\n"
-        "Используй кнопки ниже.",
+        "✅ Ты подписан на торговые сигналы Alfa Signals.\n"
+        "Новые сигналы будут приходить автоматически.",
         parse_mode="HTML",
         reply_markup=keyboard
     )
@@ -260,16 +260,16 @@ async def start_cmd(message: types.Message):
 
 @dp.message(F.text == "📜 История сигналов")
 async def show_history(message: types.Message):
-    history = await get_history()          # ← теперь функция определена
+    history = await get_history()
     if not history:
-        await message.answer("Пока нет сигналов.")
+        await message.answer("📭 Пока нет сигналов.")
         return
 
     text = "📜 <b>История сигналов</b>\n\n"
     for row in history:
         _, pair, direction, entry, tp, sl, ts, status, close_p, hashtag = row
         emoji = "📈" if direction == "LONG" else "📉"
-        st = "🟢 TP" if status == "closed_tp" else "🔴 SL" if status == "closed_sl" else "⏳ Открыт"
+        st = "✅ TP" if status == "closed_tp" else "❌ SL" if status == "closed_sl" else "⏳ Открыт"
         line = f"<b>#{hashtag}</b> {pair} {direction} {emoji}\n"
         line += f"Вход: {entry:.2f} | TP: {tp:.2f} | SL: {sl:.2f}\n"
         if close_p:
@@ -281,31 +281,30 @@ async def show_history(message: types.Message):
     await message.answer(text, parse_mode="HTML")
 
 
-@dp.message(F.text == "❌ Отписаться от сигналов")
+@dp.message(F.text == "❌ Отписаться")
 async def unsubscribe(message: types.Message):
     await remove_subscriber(message.from_user.id)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ Подписаться на сигналы")]], resize_keyboard=True)
-    await message.answer("❌ Ты отписался.", reply_markup=kb)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ Подписаться")]], resize_keyboard=True)
+    await message.answer("❌ Ты отписался от сигналов.", reply_markup=kb)
 
 
-@dp.message(F.text == "✅ Подписаться на сигналы")
+@dp.message(F.text == "✅ Подписаться")
 async def subscribe_again(message: types.Message):
     await add_subscriber(message.from_user)
     kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📜 История сигналов")], [KeyboardButton(text="❌ Отписаться от сигналов")]],
+        keyboard=[[KeyboardButton(text="📜 История сигналов")], [KeyboardButton(text="❌ Отписаться")]],
         resize_keyboard=True
     )
-    await message.answer("✅ Ты снова подписан!", reply_markup=kb)
+    await message.answer("✅ Ты снова подписан на сигналы!", reply_markup=kb)
 
 
 @dp.message(Command("test_signal"))
 async def test_signal(message: types.Message):
     if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Эта команда только для администратора.")
+        await message.answer("⛔ Команда только для администратора.")
         return
-    await message.answer("🧪 Отправляю тестовые сигналы...")
+    await message.answer("🧪 Отправляю тестовый сигнал...")
     await send_signal("BTC/USDT", "LONG", 65234.5, 66865.0, 63929.8)
-    await message.answer("✅ Тестовые сигналы отправлены.")
 
 
 # ====================== ЗАПУСК ======================
@@ -314,14 +313,13 @@ async def main():
 
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
-    # Добавляем задания с защитой от дублей
     scheduler.add_job(
         generate_signals,
         trigger="interval",
-        minutes=30,
+        minutes=10,                    # ← каждые 10 минут для теста
         id="generate_signals",
         replace_existing=True,
         max_instances=1
@@ -337,8 +335,8 @@ async def main():
     )
 
     scheduler.start()
-    print("✅ APScheduler запущен")
-    print("🚀 Бот успешно запущен! Напиши ему /start в Telegram.")
+    print("✅ APScheduler запущен (генерация каждые 10 мин, мониторинг каждые 5 мин)")
+    print("🚀 Бот успешно запущен!\n")
 
     try:
         await dp.start_polling(bot)
@@ -352,6 +350,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот остановлен пользователем")
+        logging.info("Бот остановлен")
     except Exception as e:
         logging.error(f"Критическая ошибка: {e}")
