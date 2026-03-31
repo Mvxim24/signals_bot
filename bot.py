@@ -14,7 +14,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
-# ====================== НАСТРОЙКИ ДЛЯ MACOS ======================
+# ====================== НАСТРОЙКИ ======================
 try:
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (524288, hard))
@@ -22,7 +22,6 @@ try:
 except Exception:
     pass
 
-# ========================= НАСТРОЙКИ =========================
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -107,7 +106,7 @@ async def get_history(limit: int = 100):
         """, (limit,))
 
 
-# ====================== ОТПРАВКА СИГНАЛА (КРАСИВЫЙ ДИЗАЙН) ======================
+# ====================== ОТПРАВКА СИГНАЛА (КРАСИВЫЙ ВИД) ======================
 async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
     async with aiosqlite.connect(db_path) as db:
         await db.execute('''
@@ -125,7 +124,6 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     emoji = "📈" if direction == "LONG" else "📉"
     direction_text = "LONG ▲" if direction == "LONG" else "SHORT ▼"
 
-    # Расчёт процентов
     tp_percent = ((tp - entry_price) / entry_price) * 100
     sl_percent = ((sl - entry_price) / entry_price) * 100
 
@@ -153,101 +151,109 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     print(f"✅ Сигнал отправлен → {pair} | {direction} | {entry_price:.2f}")
 
 
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (БЕЗ ЛИМИТОВ) ======================
+# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (ЗАЩИЩЁННАЯ) ======================
 async def generate_signals():
     print(f"\n🔄 [{datetime.now().strftime('%H:%M:%S')}] Запуск генерации сигналов...")
 
-    for pair in ["BTC/USDT", "ETH/USDT"]:
-        try:
-            exchange = ccxt.binance({'enableRateLimit': True})
-            ohlcv = exchange.fetch_ohlcv(pair, '1h', limit=100)
-            df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-            
-            df['sma20'] = df['close'].rolling(20).mean()
-            df['sma50'] = df['close'].rolling(50).mean()
+    try:
+        for pair in ["BTC/USDT", "ETH/USDT"]:
+            try:
+                exchange = ccxt.binance({'enableRateLimit': True})
+                ohlcv = exchange.fetch_ohlcv(pair, '1h', limit=100)
+                df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+                
+                df['sma20'] = df['close'].rolling(20).mean()
+                df['sma50'] = df['close'].rolling(50).mean()
 
-            curr = df.iloc[-1]
-            prev = df.iloc[-2]
-            price = curr['close']
+                curr = df.iloc[-1]
+                prev = df.iloc[-2]
+                price = curr['close']
 
-            if pd.isna(curr.get('sma20')) or pd.isna(curr.get('sma50')):
-                print(f"   ⚠️  Недостаточно данных для {pair}")
-                continue
+                if pd.isna(curr.get('sma20')) or pd.isna(curr.get('sma50')):
+                    print(f"   ⚠️  Недостаточно данных для {pair}")
+                    continue
 
-            direction = None
-            sl = None
-            tp = None
+                direction = None
+                sl = None
+                tp = None
 
-            if curr['sma20'] > curr['sma50'] and prev['sma20'] <= prev['sma50']:
-                direction = "LONG"
-                sl = round(price * 0.985, 2)
-                tp = round(price * 1.03, 2)
-            elif curr['sma20'] < curr['sma50'] and prev['sma20'] >= prev['sma50']:
-                direction = "SHORT"
-                sl = round(price * 1.015, 2)
-                tp = round(price * 0.97, 2)
+                if curr['sma20'] > curr['sma50'] and prev['sma20'] <= prev['sma50']:
+                    direction = "LONG"
+                    sl = round(price * 0.985, 2)
+                    tp = round(price * 1.03, 2)
+                elif curr['sma20'] < curr['sma50'] and prev['sma20'] >= prev['sma50']:
+                    direction = "SHORT"
+                    sl = round(price * 1.015, 2)
+                    tp = round(price * 0.97, 2)
 
-            if direction:
-                print(f"   🎯 Найден сигнал: {direction} | {pair} | Цена: {price:.2f}")
-                await send_signal(pair, direction, price, tp, sl)
-            else:
-                print(f"   ❌ Нет сигнала по {pair}")
+                if direction:
+                    print(f"   🎯 Найден сигнал: {direction} | {pair} | Цена: {price:.2f}")
+                    await send_signal(pair, direction, price, tp, sl)
+                else:
+                    print(f"   ❌ Нет сигнала по {pair}")
 
-        except Exception as e:
-            logging.error(f"Ошибка генерации {pair}: {e}")
-            print(f"   ❌ Ошибка при анализе {pair}: {e}")
+            except Exception as e:
+                logging.error(f"Ошибка при обработке пары {pair}: {e}", exc_info=True)
+                print(f"   ❌ Ошибка при анализе {pair}: {e}")
 
-    print(f"✅ Генерация сигналов завершена [{datetime.now().strftime('%H:%M:%S')}]\n")
+        print(f"✅ Генерация сигналов завершена [{datetime.now().strftime('%H:%M:%S')}]\n")
+
+    except Exception as e:
+        logging.error(f"КРИТИЧЕСКАЯ ошибка в generate_signals: {e}", exc_info=True)
+        print(f"💥 Критическая ошибка в генерации: {e}")
 
 
 # ====================== МОНИТОРИНГ TP/SL ======================
 async def monitor_open_signals():
-    async with aiosqlite.connect(db_path) as db:
-        rows = await db.execute_fetchall("""
-            SELECT id, pair, direction, tp, sl, hashtag FROM signals WHERE status = 'open'
-        """)
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            rows = await db.execute_fetchall("""
+                SELECT id, pair, direction, tp, sl, hashtag FROM signals WHERE status = 'open'
+            """)
 
-    for row in rows:
-        signal_id, pair, direction, tp, sl, hashtag = row
-        try:
-            exchange = ccxt.binance({'enableRateLimit': True})
-            ticker = exchange.fetch_ticker(pair)
-            current_price = ticker['last']
+        for row in rows:
+            signal_id, pair, direction, tp, sl, hashtag = row
+            try:
+                exchange = ccxt.binance({'enableRateLimit': True})
+                ticker = exchange.fetch_ticker(pair)
+                current_price = ticker['last']
 
-            closed = False
-            status = None
+                closed = False
+                status = None
 
-            if direction == "LONG":
-                if current_price >= tp:
-                    status = "closed_tp"
-                    closed = True
-                elif current_price <= sl:
-                    status = "closed_sl"
-                    closed = True
-            else:
-                if current_price <= tp:
-                    status = "closed_tp"
-                    closed = True
-                elif current_price >= sl:
-                    status = "closed_sl"
-                    closed = True
+                if direction == "LONG":
+                    if current_price >= tp:
+                        status = "closed_tp"
+                        closed = True
+                    elif current_price <= sl:
+                        status = "closed_sl"
+                        closed = True
+                else:
+                    if current_price <= tp:
+                        status = "closed_tp"
+                        closed = True
+                    elif current_price >= sl:
+                        status = "closed_sl"
+                        closed = True
 
-            if closed:
-                async with aiosqlite.connect(db_path) as db:
-                    await db.execute("UPDATE signals SET status = ?, close_price = ? WHERE id = ?",
-                                     (status, current_price, signal_id))
-                    await db.commit()
+                if closed:
+                    async with aiosqlite.connect(db_path) as db:
+                        await db.execute("UPDATE signals SET status = ?, close_price = ? WHERE id = ?",
+                                         (status, current_price, signal_id))
+                        await db.commit()
 
-                status_text = "✅ TAKE PROFIT" if status == "closed_tp" else "❌ STOP LOSS"
-                text = f"""📢 <b>Сигнал закрыт #{hashtag}</b>
+                    status_text = "✅ TAKE PROFIT" if status == "closed_tp" else "❌ STOP LOSS"
+                    text = f"""📢 <b>Сигнал закрыт #{hashtag}</b>
 
 {status_text}
 Цена закрытия: <b>{current_price:,.2f} USDT</b>"""
 
-                await broadcast_message(text)
-                print(f"📌 Сигнал закрыт: #{hashtag} → {status_text}")
-        except Exception as e:
-            logging.error(f"Ошибка мониторинга #{hashtag}: {e}")
+                    await broadcast_message(text)
+                    print(f"📌 Сигнал закрыт: #{hashtag} → {status_text}")
+            except Exception as e:
+                logging.error(f"Ошибка мониторинга #{hashtag}: {e}")
+    except Exception as e:
+        logging.error(f"Ошибка в monitor_open_signals: {e}", exc_info=True)
 
 
 # ====================== ХЭНДЛЕРЫ ======================
@@ -323,7 +329,7 @@ async def test_signal(message: types.Message):
     await send_signal("BTC/USDT", "LONG", 65234.5, 66865.0, 63929.8)
 
 
-# ====================== ЗАПУСК ======================
+# ====================== ЗАПУСК (ИСПРАВЛЕННЫЙ) ======================
 async def main():
     await init_db()
 
@@ -335,7 +341,7 @@ async def main():
     scheduler.add_job(
         generate_signals,
         trigger="interval",
-        minutes=10,                    # каждые 10 минут для теста
+        minutes=10,
         id="generate_signals",
         replace_existing=True,
         max_instances=1
@@ -356,7 +362,10 @@ async def main():
 
     try:
         await dp.start_polling(bot)
+    except Exception as e:
+        logging.error(f"Ошибка в polling: {e}", exc_info=True)
     finally:
+        print("🛑 Бот завершает работу...")
         if scheduler.running:
             scheduler.shutdown(wait=False)
         await bot.session.close()
@@ -366,6 +375,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот остановлен")
+        logging.info("Бот остановлен пользователем")
     except Exception as e:
-        logging.error(f"Критическая ошибка: {e}")
+        logging.error(f"Критическая ошибка запуска: {e}", exc_info=True)
