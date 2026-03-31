@@ -1,7 +1,5 @@
-aiogram
+aiogram==3.13.*
 ccxt
-aiosqlite
 pandas
-pandas-ta
-apscheduler
+aiosqlite
 python-dotenv
