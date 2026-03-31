@@ -2,7 +2,7 @@ import asyncio
 import logging
 import resource
 import os
-from datetime import datetime, date
+from datetime import datetime
 
 import pandas as pd
 import ccxt
@@ -107,7 +107,7 @@ async def get_history(limit: int = 30):
         """, (limit,))
 
 
-# ====================== ОТПРАВКА СИГНАЛА (КРАСИВО) ======================
+# ====================== ОТПРАВКА СИГНАЛА (С ИСПРАВЛЕННЫМ ВРЕМЕНЕМ) ======================
 async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
     async with aiosqlite.connect(db_path) as db:
         await db.execute('''
@@ -123,7 +123,10 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     hashtag = f"SIG_{signal_id:04d}"
 
     emoji = "📈" if direction == "LONG" else "📉"
-    direction_text = "LONG" if direction == "LONG" else "SHORT"
+    direction_text = "LONG ▲" if direction == "LONG" else "SHORT ▼"
+
+    # Время в UTC — теперь будет совпадать с реальным временем сигнала
+    current_time_utc = datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M:%S UTC')
 
     text = f"""🚨 <b>НОВЫЙ ТОРГОВЫЙ СИГНАЛ #{hashtag}</b>
 
@@ -133,7 +136,7 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
 🎯 <b>Take Profit:</b> <code>{tp:.2f} USDT</code>
 🛑 <b>Stop Loss:</b> <code>{sl:.2f} USDT</code>
 
-🕒 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}
+🕒 <b>Время сигнала:</b> {current_time_utc}
 
 🔍 <b>#{hashtag}</b>"""
 
@@ -141,7 +144,7 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     print(f"✅ Сигнал отправлен → {pair} | {direction} | {entry_price:.2f}")
 
 
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (БЕЗ ЛИМИТОВ + КРАСИВО) ======================
+# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (БЕЗ ЛИМИТОВ) ======================
 async def generate_signals():
     print(f"\n🔄 [{datetime.now().strftime('%H:%M:%S')}] Запуск генерации сигналов...")
 
@@ -319,7 +322,7 @@ async def main():
     scheduler.add_job(
         generate_signals,
         trigger="interval",
-        minutes=10,                    # ← каждые 10 минут для теста
+        minutes=10,                    # каждые 10 минут для теста
         id="generate_signals",
         replace_existing=True,
         max_instances=1
