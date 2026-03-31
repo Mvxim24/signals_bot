@@ -11,7 +11,6 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp_socks import ProxyConnector  # Для обхода Connection Reset
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
@@ -34,15 +33,13 @@ if not TOKEN:
 
 db_path = "signals.db"
 
-# --- НАСТРОЙКА ПРОКСИ (ДЛЯ ОБХОДА CONNECTION RESET) ---
-# Если у вас есть конкретный прокси, расскомментируйте строку ниже и вставьте данные:
-# connector = ProxyConnector.from_url('socks5://user:pass@host:port')
-# session = AiohttpSession(connector=connector)
-
-# Если используете системный VPN, оставляем так:
+# Настройка сессии бота
 session = AiohttpSession()
 bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher()
+
+# Глобальный scheduler (чтобы можно было gracefully shutdown)
+scheduler = AsyncIOScheduler(timezone="UTC")
 
 
 # ====================== БАЗА ДАННЫХ ======================
@@ -137,14 +134,6 @@ Stop Loss: <b>{sl:.2f} USDT</b>
 Поиск: <b>#{hashtag}</b>"""
 
     await broadcast_message(text)
-
-
-# ====================== ИСТОРИЯ ======================
-async def get_history(limit: int = 30):
-    async with aiosqlite.connect(db_path) as db:
-        return await db.execute_fetchall("""
-            SELECT * FROM signals ORDER BY id DESC LIMIT ?
-        """, (limit,))
 
 
 # ====================== ГЕНЕРАЦИЯ СИГНАЛОВ ======================
@@ -311,18 +300,43 @@ async def test_signal(message: types.Message):
 # ====================== ЗАПУСК ======================
 async def main():
     await init_db()
-    logging.basicConfig(level=logging.INFO)
 
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(generate_signals, "interval", minutes=30)
-    scheduler.add_job(monitor_open_signals, "interval", minutes=5)
+    # Настройка логирования (лучше делать в самом начале)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    # Добавляем задания с защитой от дублей
+    scheduler.add_job(
+        generate_signals,
+        trigger="interval",
+        minutes=30,
+        id="generate_signals",
+        replace_existing=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        monitor_open_signals,
+        trigger="interval",
+        minutes=5,
+        id="monitor_open_signals",
+        replace_existing=True,
+        max_instances=1
+    )
+
     scheduler.start()
+    print("✅ APScheduler запущен (generate_signals каждые 30 мин, monitor каждые 5 мин)")
 
     print("🚀 Бот успешно запущен! Напиши ему /start в Telegram.")
 
     try:
         await dp.start_polling(bot)
     finally:
+        # Корректное завершение
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
         await bot.session.close()
 
 
@@ -330,4 +344,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот остановлен")
+        logging.info("Бот остановлен пользователем")
+    except Exception as e:
+        logging.error(f"Критическая ошибка: {e}")
