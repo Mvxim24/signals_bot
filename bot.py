@@ -1,12 +1,12 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
-from collections import defaultdict
-
 import pandas as pd
 import ccxt
 import aiosqlite
+import pandas_ta as ta  # Профессиональная библиотека индикаторов
+from datetime import datetime, timezone
+from collections import defaultdict
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
@@ -16,308 +16,151 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Глобальный флаг защиты от двойного запуска
-is_generating = False
-
+# --- КОНФИГУРАЦИЯ ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-
-if not TOKEN:
-    raise ValueError("❌ TELEGRAM_TOKEN не найден в .env!")
-
+PAIRS = ["BTC/USDT", "ETH/USDT"]
+TIMEFRAME = '1h'  # Часовой таймфрейм
 db_path = "signals.db"
 
 bot = Bot(token=TOKEN, session=AiohttpSession())
 dp = Dispatcher()
-
-# Подключение к MEXC
 exchange = ccxt.mexc({'enableRateLimit': True})
-
-# Хранилище времени последних сигналов (защита от спама)
-last_signal_time = defaultdict(lambda: datetime(2000, 1, 1, tzinfo=timezone.utc))
 scheduler = AsyncIOScheduler(timezone="UTC")
+is_generating = False
 
-
-# ====================== БАЗА ДАННЫХ ======================
+# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(db_path) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS subscribers (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                subscribed_at TEXT
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pair TEXT,
-                direction TEXT,
-                entry_price REAL,
-                tp REAL,
-                sl REAL,
-                timestamp TEXT,
-                status TEXT DEFAULT 'open',
-                close_price REAL,
-                hashtag TEXT
-            )
-        ''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS subscribers (user_id INTEGER PRIMARY KEY)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, pair TEXT, direction TEXT, 
+            entry_price REAL, tp REAL, sl REAL, timestamp TEXT, status TEXT DEFAULT 'open', hashtag TEXT
+        )''')
         await db.commit()
-
-
-async def add_subscriber(user: types.User):
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute('''
-            INSERT OR REPLACE INTO subscribers (user_id, username, first_name, subscribed_at)
-            VALUES (?, ?, ?, ?)
-        ''', (user.id, user.username, user.first_name, datetime.now(timezone.utc).isoformat()))
-        await db.commit()
-
-
-async def remove_subscriber(user_id: int):
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("DELETE FROM subscribers WHERE user_id = ?", (user_id,))
-        await db.commit()
-
-
-async def get_all_subscribers():
-    async with aiosqlite.connect(db_path) as db:
-        rows = await db.execute_fetchall("SELECT user_id FROM subscribers")
-        return [row[0] for row in rows]
-
 
 async def broadcast_message(text: str):
-    subscribers = await get_all_subscribers()
-    tasks = [bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True) for uid in subscribers]
+    async with aiosqlite.connect(db_path) as db:
+        rows = await db.execute_fetchall("SELECT user_id FROM subscribers")
+    tasks = [bot.send_message(row[0], text, parse_mode="HTML") for row in rows]
     await asyncio.gather(*tasks, return_exceptions=True)
 
-
-# ====================== ОТПРАВКА СИГНАЛА ======================
-async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
-    key = f"{pair}_{direction}"
-    now = datetime.now(timezone.utc)
-    
-    # Не частим с одинаковыми сигналами (минимум 30 мин разницы)
-    if (now - last_signal_time[key]).total_seconds() < 1800:
-        return
-    last_signal_time[key] = now
-
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute('''
-            INSERT INTO signals (pair, direction, entry_price, tp, sl, timestamp, status, hashtag)
-            VALUES (?, ?, ?, ?, ?, ?, 'open', 'temp')
-        ''', (pair, direction, entry_price, tp, sl, now.isoformat()))
-        await db.commit()
-        cursor = await db.execute("SELECT last_insert_rowid()")
-        signal_id = (await cursor.fetchone())[0]
-
-    hashtag = f"SIG_{signal_id:04d}"
-    
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("UPDATE signals SET hashtag = ? WHERE id = ?", (hashtag, signal_id))
-        await db.commit()
-
-    emoji = "📈" if direction == "LONG" else "📉"
-    direction_text = "LONG ▲" if direction == "LONG" else "SHORT ▼"
-
-    tp_p = ((tp - entry_price) / entry_price) * 100
-    sl_p = ((sl - entry_price) / entry_price) * 100
-
-    text = f"""🚨 <b>НОВЫЙ ТОРГОВЫЙ СИГНАЛ #{hashtag}</b>
-
-{emoji} <b>{pair}</b> — <b>{direction_text}</b> {emoji}
-
-──────────────────
-💰 <b>Цена входа:</b> <code>{entry_price:,.2f} USDT</code>
-🎯 <b>Take Profit:</b> <code>{tp:,.2f} USDT</code> <b>(+{tp_p:.2f}%)</b>
-🛑 <b>Stop Loss:</b> <code>{sl:,.2f} USDT</code> <b>({sl_p:.2f}%)</b>
-
-🕒 <b>Время сигнала:</b> {now.strftime('%d.%m.%Y %H:%M:%S UTC')}
-
-🔍 <b>#{hashtag}</b>"""
-
-    await broadcast_message(text)
-    print(f"✅ Сигнал отправлен → {pair} | {direction}")
-
-
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ ======================
+# --- ЛОГИКА СИГНАЛОВ (Strategy Core) ---
 async def generate_signals():
     global is_generating
-    if is_generating:
-        return
-    
+    if is_generating: return
     is_generating = True
-    pairs = ["BTC/USDT", "ETH/USDT"]
-
+    
     try:
-        for pair in pairs:
-            try:
-                # Берем часовые свечи. Можно сменить на '15m' для более частых сигналов
-                ohlcv = exchange.fetch_ohlcv(pair, '1h', limit=100)
-                df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-                df['sma20'] = df['close'].rolling(20).mean()
-                df['sma50'] = df['close'].rolling(50).mean()
+        for pair in PAIRS:
+            # Загружаем чуть больше данных для точности индикаторов
+            ohlcv = exchange.fetch_ohlcv(pair, TIMEFRAME, limit=100)
+            df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+            
+            # Считаем SMA через pandas_ta (как в проф. ботах)
+            df['sma_fast'] = ta.sma(df['close'], length=20)
+            df['sma_slow'] = ta.sma(df['close'], length=50)
+            
+            # Берем последнюю ЗАКРЫТУЮ свечу (индекс -2), так как -1 еще шевелится
+            last_closed = df.iloc[-2]
+            prev_closed = df.iloc[-3]
+            current_price = df.iloc[-1]['close'] # Актуальная цена для входа
 
-                curr = df.iloc[-1]
-                prev = df.iloc[-2]
-                price = float(curr['close'])
+            # Условия пересечения (Golden Cross / Death Cross)
+            long_cross = (prev_closed['sma_fast'] <= prev_closed['sma_slow']) and \
+                         (last_closed['sma_fast'] > last_closed['sma_slow'])
+            
+            short_cross = (prev_closed['sma_fast'] >= prev_closed['sma_slow']) and \
+                          (last_closed['sma_fast'] < last_closed['sma_slow'])
 
-                if pd.isna(curr.get('sma20')) or pd.isna(curr.get('sma50')):
-                    continue
+            # Доп. фильтр: объем должен быть выше среднего (защита от ложных входов)
+            avg_vol = df['vol'].tail(20).mean()
+            vol_ok = last_closed['vol'] > avg_vol
 
-                direction = None
-                sl = tp = None
+            direction = None
+            if long_cross and vol_ok:
+                direction, tp_mult, sl_mult = "LONG", 1.03, 0.985
+            elif short_cross and vol_ok:
+                direction, tp_mult, sl_mult = "SHORT", 0.97, 1.015
 
-                # Логика пересечения скользящих средних
-                if curr['sma20'] > curr['sma50'] and prev['sma20'] <= prev['sma50']:
-                    direction = "LONG"
-                    sl = round(price * 0.985, 2)
-                    tp = round(price * 1.03, 2)
-                elif curr['sma20'] < curr['sma50'] and prev['sma20'] >= prev['sma50']:
-                    direction = "SHORT"
-                    sl = round(price * 1.015, 2)
-                    tp = round(price * 0.97, 2)
+            if direction:
+                entry = round(current_price, 2)
+                tp = round(entry * tp_mult, 2)
+                sl = round(entry * sl_mult, 2)
+                await send_signal_logic(pair, direction, entry, tp, sl)
 
-                if direction:
-                    await send_signal(pair, direction, price, tp, sl)
-            except Exception as e:
-                logging.error(f"Ошибка анализа {pair}: {e}")
+    except Exception as e:
+        logging.error(f"Ошибка стратегии: {e}")
     finally:
         is_generating = False
 
-
-# ====================== МОНИТОРИНГ ТЕЙКОВ/СТОПОВ ======================
-async def monitor_open_signals():
-    try:
-        async with aiosqlite.connect(db_path) as db:
-            rows = await db.execute_fetchall("""
-                SELECT id, pair, direction, tp, sl, hashtag FROM signals WHERE status = 'open'
-            """)
-
-        needs_new_check = False
-
-        for row in rows:
-            signal_id, pair, direction, tp, sl, hashtag = row
-            try:
-                ticker = exchange.fetch_ticker(pair)
-                current_price = ticker['last']
-
-                closed = False
-                status = None
-
-                if direction == "LONG":
-                    if current_price >= tp:
-                        status = "closed_tp"; closed = True
-                    elif current_price <= sl:
-                        status = "closed_sl"; closed = True
-                else:
-                    if current_price <= tp:
-                        status = "closed_tp"; closed = True
-                    elif current_price >= sl:
-                        status = "closed_sl"; closed = True
-
-                if closed:
-                    async with aiosqlite.connect(db_path) as db:
-                        await db.execute(
-                            "UPDATE signals SET status = ?, close_price = ? WHERE id = ?",
-                            (status, current_price, signal_id)
-                        )
-                        await db.commit()
-
-                    status_text = "✅ TAKE PROFIT" if status == "closed_tp" else "❌ STOP LOSS"
-                    text = f"📢 <b>Сигнал закрыт #{hashtag}</b>\n\n{status_text}\nЦена закрытия: <b>{current_price:,.2f} USDT</b>"
-
-                    await broadcast_message(text)
-                    needs_new_check = True
-
-            except Exception as e:
-                logging.error(f"Ошибка мониторинга {hashtag}: {e}")
-        
-        # Если сделка закрылась, мгновенно ищем новую возможность
-        if needs_new_check:
-            asyncio.create_task(generate_signals())
-
-    except Exception as e:
-        logging.error(f"Ошибка в monitor_open_signals: {e}")
-
-
-# ====================== ХЭНДЛЕРЫ ======================
-@dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    await add_subscriber(message.from_user)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📜 История сигналов")],
-            [KeyboardButton(text="❌ Отписаться")]
-        ],
-        resize_keyboard=True
-    )
-    # Твое кастомное приветствие
-    welcome_text = (
-        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-        f"🤖 Этот бот сделан чтобы отслеживать сигналы по биткоин и эфиру.\n"
-        f"Я анализирую графики MEXC в реальном времени и присылаю уведомления."
-    )
-    await message.answer(welcome_text, parse_mode="HTML", reply_markup=kb)
-
-
-@dp.message(F.text == "📜 История сигналов")
-async def show_history(message: types.Message):
-    async with aiosqlite.connect(db_path) as db:
-        history = await db.execute_fetchall("SELECT * FROM signals ORDER BY id DESC LIMIT 15")
-    if not history:
-        await message.answer("📭 История пуста.")
-        return
-
-    text = "📜 <b>Последние сигналы:</b>\n\n"
-    for row in history:
-        _, pair, direction, entry, tp, sl, ts, status, close_p, hashtag = row
-        emoji = "📈" if direction == "LONG" else "📉"
-        st = "✅ TP" if status == "closed_tp" else "❌ SL" if status == "closed_sl" else "⏳ Open"
-        text += f"<b>#{hashtag}</b> {pair} {direction} {emoji}\n"
-        text += f"Вход: {entry:,.2f} | Статус: {st}\n\n"
+async def send_signal_logic(pair, direction, entry, tp, sl):
+    now = datetime.now(timezone.utc)
+    hashtag = f"SIG_{now.strftime('%H%M%S')}"
     
-    await message.answer(text, parse_mode="HTML")
+    # Сохраняем в БД
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("INSERT INTO signals (pair, direction, entry_price, tp, sl, timestamp, hashtag) VALUES (?,?,?,?,?,?,?)",
+                         (pair, direction, entry, tp, sl, now.isoformat(), hashtag))
+        await db.commit()
 
+    emoji = "🚀" if direction == "LONG" else "📉"
+    text = f"""{emoji} <b>НОВЫЙ СИГНАЛ: {pair}</b> {emoji}
+    
+<b>Направление:</b> {direction}
+<b>Вход:</b> <code>{entry}</code>
+<b>Цель (TP):</b> <code>{tp}</code>
+<b>Стоп (SL):</b> <code>{sl}</code>
 
-@dp.message(F.text == "❌ Отписаться")
-async def unsubscribe(message: types.Message):
-    await remove_subscriber(message.from_user.id)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ Подписаться")]], resize_keyboard=True)
-    await message.answer("❌ Подписка отключена.", reply_markup=kb)
+📊 <i>Сигнал сформирован на основе пересечения SMA 20/50 с подтверждением объема.</i>
+#{hashtag}"""
+    await broadcast_message(text)
 
+# --- МОНИТОРИНГ (Check TP/SL) ---
+async def monitor_open_signals():
+    async with aiosqlite.connect(db_path) as db:
+        rows = await db.execute_fetchall("SELECT id, pair, direction, tp, sl, hashtag FROM signals WHERE status = 'open'")
+    
+    for row in rows:
+        sid, pair, direct, tp, sl, hashtag = row
+        ticker = exchange.fetch_ticker(pair)
+        price = ticker['last']
+        
+        closed = False
+        if direct == "LONG":
+            if price >= tp: res = "✅ TAKE PROFIT"; closed = True
+            elif price <= sl: res = "❌ STOP LOSS"; closed = True
+        else:
+            if price <= tp: res = "✅ TAKE PROFIT"; closed = True
+            elif price >= sl: res = "❌ STOP LOSS"; closed = True
+            
+        if closed:
+            async with aiosqlite.connect(db_path) as db:
+                await db.execute("UPDATE signals SET status = 'closed' WHERE id = ?", (sid,))
+                await db.commit()
+            await broadcast_message(f"🏁 <b>Сигнал {hashtag} закрыт!</b>\nРезультат: {res}\nЦена: {price}")
+            asyncio.create_task(generate_signals()) # Сразу ищем новый вход
 
-@dp.message(F.text == "✅ Подписаться")
-async def subscribe_again(message: types.Message):
-    await add_subscriber(message.from_user)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📜 История сигналов")], [KeyboardButton(text="❌ Отписаться")]],
-        resize_keyboard=True
-    )
-    await message.answer("✅ Ты снова в деле! Жди сигналы.", reply_markup=kb)
+# --- ХЭНДЛЕРЫ ---
+@dp.message(Command("start"))
+async def start(m: types.Message):
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("INSERT OR IGNORE INTO subscribers VALUES (?)", (m.from_user.id,))
+        await db.commit()
+    await m.answer("👋 <b>Привет!</b>\nЭтот бот отслеживает сигналы по BTC и ETH (SMA 20/50 + Volume).")
 
-
-# ====================== ЗАПУСК ======================
+# --- ЗАПУСК ---
 async def main():
     await init_db()
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-    # ПРОВЕРКА РЫНКА КАЖДЫЕ 10 СЕКУНД (Мгновенно)
-    scheduler.add_job(generate_signals, 'interval', seconds=10, replace_existing=True)
+    logging.basicConfig(level=logging.INFO)
     
-    # МОНИТОРИНГ ТЕЙКОВ КАЖДЫЕ 30 СЕКУНД
-    scheduler.add_job(monitor_open_signals, 'interval', seconds=30, replace_existing=True)
-
+    # Как ты просил: очень частая проверка (каждые 10 сек)
+    scheduler.add_job(generate_signals, 'interval', seconds=10)
+    scheduler.add_job(monitor_open_signals, 'interval', seconds=30)
     scheduler.start()
-    print("🚀 Бот запущен в режиме REAL-TIME (10 сек)")
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        scheduler.shutdown()
-        await bot.session.close()
-
+    
+    print("💎 Снайпер-бот запущен. Охота на BTC/ETH началась!")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
