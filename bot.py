@@ -5,12 +5,13 @@ from datetime import datetime, timezone
 from collections import defaultdict
 
 import pandas as pd
-import ccxt.pro as ccxt
+import ccxt
 import aiosqlite
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.session.aiohttp import AiohttpSession
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,17 +27,11 @@ db_path = "signals.db"
 bot = Bot(token=TOKEN, session=AiohttpSession())
 dp = Dispatcher()
 
-# ====================== MEXC ======================
-exchange = ccxt.mexc({
-    'enableRateLimit': True,
-    'options': {
-        'defaultType': 'spot',
-        'recvWindow': 20000,
-    },
-    'timeout': 30000,
-})
+exchange = ccxt.mexc({'enableRateLimit': True})
 
 last_signal_time = defaultdict(lambda: datetime(2000, 1, 1, tzinfo=timezone.utc))
+scheduler = AsyncIOScheduler(timezone="UTC")
+
 
 # ====================== БАЗА ДАННЫХ ======================
 async def init_db():
@@ -97,7 +92,7 @@ async def broadcast_message(text: str):
 async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
     key = f"{pair}_{direction}"
     now = datetime.now(timezone.utc)
-    if (now - last_signal_time[key]).total_seconds() < 1800:  # 30 минут
+    if (now - last_signal_time[key]).total_seconds() < 1800:
         return
     last_signal_time[key] = now
 
@@ -134,55 +129,95 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     print(f"✅ Сигнал отправлен → {pair} | {direction} | {entry_price:.2f}")
 
 
-# ====================== РЕАЛ-ТАЙМ МОНИТОРИНГ СВЕЧЕЙ ======================
-async def watch_ohlcv_for_signals():
-    print("📡 Запуск реал-тайм мониторинга на MEXC (1h)")
+# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ ======================
+async def generate_signals():
+    print(f"🔄 Проверка сигналов MEXC [{datetime.now().strftime('%H:%M:%S')}]")
     pairs = ["BTC/USDT", "ETH/USDT"]
 
-    while True:
+    for pair in pairs:
         try:
-            await exchange.load_markets()
-            print("✅ Рынки MEXC успешно загружены!")
+            ohlcv = exchange.fetch_ohlcv(pair, '1h', limit=100)
+            df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+            df['sma20'] = df['close'].rolling(20).mean()
+            df['sma50'] = df['close'].rolling(50).mean()
 
-            while True:
-                for pair in pairs:
-                    try:
-                        ohlcv = await exchange.watch_ohlcv(pair, '1h', limit=3)
-                        if len(ohlcv) < 2:
-                            continue
+            curr = df.iloc[-1]
+            prev = df.iloc[-2]
+            price = float(curr['close'])
 
-                        df = pd.DataFrame(ohlcv[-2:], columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-                        curr = df.iloc[-1]
-                        prev = df.iloc[-2]
-                        price = float(curr['close'])
+            if pd.isna(curr.get('sma20')) or pd.isna(curr.get('sma50')):
+                continue
 
-                        # SMA
-                        closes = pd.Series([float(c[4]) for c in ohlcv[-60:]])
-                        sma20 = closes.rolling(20).mean().iloc[-1]
-                        sma50 = closes.rolling(50).mean().iloc[-1]
+            direction = None
+            sl = tp = None
 
-                        if pd.isna(sma20) or pd.isna(sma50):
-                            continue
+            if curr['sma20'] > curr['sma50'] and prev['sma20'] <= prev['sma50']:
+                direction = "LONG"
+                sl = round(price * 0.985, 2)
+                tp = round(price * 1.03, 2)
+            elif curr['sma20'] < curr['sma50'] and prev['sma20'] >= prev['sma50']:
+                direction = "SHORT"
+                sl = round(price * 1.015, 2)
+                tp = round(price * 0.97, 2)
 
-                        if sma20 > sma50 and prev.get('sma20', 0) <= prev.get('sma50', 0):
-                            sl = round(price * 0.985, 2)
-                            tp = round(price * 1.03, 2)
-                            await send_signal(pair, "LONG", price, tp, sl)
-                        elif sma20 < sma50 and prev.get('sma20', 0) >= prev.get('sma50', 0):
-                            sl = round(price * 1.015, 2)
-                            tp = round(price * 0.97, 2)
-                            await send_signal(pair, "SHORT", price, tp, sl)
-
-                    except Exception as e:
-                        logging.error(f"Ошибка по паре {pair}: {e}")
-                        await asyncio.sleep(2)
-
-                await asyncio.sleep(1)
-
+            if direction:
+                await send_signal(pair, direction, price, tp, sl)
         except Exception as e:
-            logging.error(f"Критическая ошибка watch_ohlcv (MEXC): {e}")
-            print("🔄 Перезапуск через 15 секунд...")
-            await asyncio.sleep(15)
+            logging.error(f"Ошибка генерации {pair}: {e}")
+
+
+# ====================== МОНИТОРИНГ TP/SL ======================
+async def monitor_open_signals():
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            rows = await db.execute_fetchall("""
+                SELECT id, pair, direction, tp, sl, hashtag FROM signals WHERE status = 'open'
+            """)
+
+        for row in rows:
+            signal_id, pair, direction, tp, sl, hashtag = row
+            try:
+                ticker = exchange.fetch_ticker(pair)
+                current_price = ticker['last']
+
+                closed = False
+                status = None
+
+                if direction == "LONG":
+                    if current_price >= tp:
+                        status = "closed_tp"
+                        closed = True
+                    elif current_price <= sl:
+                        status = "closed_sl"
+                        closed = True
+                else:
+                    if current_price <= tp:
+                        status = "closed_tp"
+                        closed = True
+                    elif current_price >= sl:
+                        status = "closed_sl"
+                        closed = True
+
+                if closed:
+                    async with aiosqlite.connect(db_path) as db:
+                        await db.execute(
+                            "UPDATE signals SET status = ?, close_price = ? WHERE id = ?",
+                            (status, current_price, signal_id)
+                        )
+                        await db.commit()
+
+                    status_text = "✅ TAKE PROFIT" if status == "closed_tp" else "❌ STOP LOSS"
+                    text = f"""📢 <b>Сигнал закрыт #{hashtag}</b>
+
+{status_text}
+Цена закрытия: <b>{current_price:,.2f} USDT</b>"""
+
+                    await broadcast_message(text)
+                    print(f"📌 Сигнал #{hashtag} закрыт → {status_text}")
+            except Exception as e:
+                logging.error(f"Ошибка мониторинга {hashtag}: {e}")
+    except Exception as e:
+        logging.error(f"Ошибка в monitor_open_signals: {e}")
 
 
 # ====================== ХЭНДЛЕРЫ ======================
@@ -196,17 +231,49 @@ async def start_cmd(message: types.Message):
         ],
         resize_keyboard=True
     )
-    await message.answer(f"👋 <b>Привет!</b>\n✅ Ты подписан на реал-тайм сигналы с MEXC.", parse_mode="HTML", reply_markup=kb)
+    await message.answer(f"👋 <b>Привет, {message.from_user.first_name}!</b>\n✅ Ты подписан на сигналы с MEXC.", 
+                         parse_mode="HTML", reply_markup=kb)
 
 
 @dp.message(F.text == "📜 История сигналов")
 async def show_history(message: types.Message):
     async with aiosqlite.connect(db_path) as db:
-        history = await db.execute_fetchall("SELECT * FROM signals ORDER BY id DESC LIMIT 50")
+        history = await db.execute_fetchall("SELECT * FROM signals ORDER BY id DESC LIMIT 100")
     if not history:
         await message.answer("📭 Пока нет сигналов.")
         return
-    await message.answer("📜 История скоро будет полной. Пока показаны последние 50 сигналов (функция в разработке).")
+
+    text = "📜 <b>История сигналов (последние 100)</b>\n\n"
+    for row in history:
+        _, pair, direction, entry, tp, sl, ts, status, close_p, hashtag = row
+        emoji = "📈" if direction == "LONG" else "📉"
+        st = "✅ TP" if status == "closed_tp" else "❌ SL" if status == "closed_sl" else "⏳ Открыт"
+        line = f"<b>#{hashtag}</b> {pair} {direction} {emoji}\n"
+        line += f"Вход: {entry:.2f} | TP: {tp:.2f} | SL: {sl:.2f}\n"
+        if close_p:
+            line += f"Закрыто: {close_p:.2f} — {st}\n"
+        else:
+            line += f"Статус: {st}\n"
+        line += f"Время: {ts[:16]}\n\n"
+        text += line
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(F.text == "❌ Отписаться")
+async def unsubscribe(message: types.Message):
+    await remove_subscriber(message.from_user.id)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ Подписаться")]], resize_keyboard=True)
+    await message.answer("❌ Ты отписался от сигналов.", reply_markup=kb)
+
+
+@dp.message(F.text == "✅ Подписаться")
+async def subscribe_again(message: types.Message):
+    await add_subscriber(message.from_user)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📜 История сигналов")], [KeyboardButton(text="❌ Отписаться")]],
+        resize_keyboard=True
+    )
+    await message.answer("✅ Ты снова подписан!", reply_markup=kb)
 
 
 @dp.message(Command("test_signal"))
@@ -214,7 +281,7 @@ async def test_signal(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔ Только для админа.")
         return
-    await message.answer("🧪 Отправляю тестовый сигнал с MEXC...")
+    await message.answer("🧪 Отправляю тестовый сигнал...")
     await send_signal("BTC/USDT", "LONG", 65234.5, 66865.0, 63929.8)
 
 
@@ -223,16 +290,19 @@ async def main():
     await init_db()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    print("🚀 Бот запущен на MEXC (реал-тайм режим)")
+    scheduler.add_job(generate_signals, 'interval', minutes=5, replace_existing=True)
+    scheduler.add_job(monitor_open_signals, 'interval', seconds=30, replace_existing=True)
 
-    task = asyncio.create_task(watch_ohlcv_for_signals())
+    scheduler.start()
+    print("🚀 Бот успешно запущен на MEXC!")
+    print("   • Новые сигналы — каждые 5 минут")
+    print("   • Проверка TP/SL — каждые 30 секунд")
 
     try:
-        await asyncio.gather(dp.start_polling(bot), task)
+        await dp.start_polling(bot)
     finally:
-        await exchange.close()
+        scheduler.shutdown()
         await bot.session.close()
-        print("🛑 Бот остановлен")
 
 
 if __name__ == "__main__":
