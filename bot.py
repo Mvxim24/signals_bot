@@ -2,7 +2,8 @@ import asyncio
 import logging
 import resource
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+from collections import defaultdict
 
 import pandas as pd
 import ccxt
@@ -18,7 +19,7 @@ from dotenv import load_dotenv
 try:
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (524288, hard))
-    print(f"✅ Лимит открытых файлов увеличен")
+    print(f"✅ Лимит открытых файлов увеличен до 524288")
 except Exception:
     pass
 
@@ -38,6 +39,11 @@ dp = Dispatcher()
 
 scheduler = AsyncIOScheduler(timezone="UTC")
 
+# Глобальный клиент CCXT (чтобы не создавать каждый раз новый)
+exchange = ccxt.binance({'enableRateLimit': True})
+
+# Кэш для предотвращения дублирования сигналов (pair + direction → время последнего сигнала)
+last_signal_time = defaultdict(datetime)
 
 # ====================== БАЗА ДАННЫХ ======================
 async def init_db():
@@ -73,7 +79,7 @@ async def add_subscriber(user: types.User):
         await db.execute('''
             INSERT OR REPLACE INTO subscribers (user_id, username, first_name, subscribed_at)
             VALUES (?, ?, ?, ?)
-        ''', (user.id, user.username, user.first_name, datetime.now().isoformat()))
+        ''', (user.id, user.username, user.first_name, datetime.now(timezone.utc).isoformat()))
         await db.commit()
 
 
@@ -91,11 +97,15 @@ async def get_all_subscribers():
 
 async def broadcast_message(text: str, parse_mode="HTML"):
     subscribers = await get_all_subscribers()
+    tasks = []
     for user_id in subscribers:
-        try:
-            await bot.send_message(user_id, text, parse_mode=parse_mode, disable_web_page_preview=True)
-        except Exception as e:
-            logging.error(f"Ошибка отправки пользователю {user_id}: {e}")
+        tasks.append(bot.send_message(user_id, text, parse_mode=parse_mode, disable_web_page_preview=True))
+    
+    # Отправляем всем параллельно с обработкой ошибок
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for res in results:
+        if isinstance(res, Exception):
+            logging.error(f"Ошибка рассылки: {res}")
 
 
 # ====================== ИСТОРИЯ ======================
@@ -106,18 +116,26 @@ async def get_history(limit: int = 100):
         """, (limit,))
 
 
-# ====================== ОТПРАВКА СИГНАЛА (КРАСИВЫЙ ВИД) ======================
+# ====================== ОТПРАВКА СИГНАЛА ======================
 async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
+    # Защита от дублирования сигнала в ближайшие 30 минут
+    key = f"{pair}_{direction}"
+    now = datetime.now(timezone.utc)
+    if key in last_signal_time and (now - last_signal_time[key]).total_seconds() < 1800:  # 30 минут
+        print(f"⚠️ Сигнал {pair} {direction} уже отправлялся недавно. Пропуск.")
+        return
+
+    last_signal_time[key] = now
+
     async with aiosqlite.connect(db_path) as db:
         await db.execute('''
             INSERT INTO signals (pair, direction, entry_price, tp, sl, timestamp, status, hashtag)
             VALUES (?, ?, ?, ?, ?, ?, 'open', 'temp')
-        ''', (pair, direction, entry_price, tp, sl, datetime.now().isoformat()))
+        ''', (pair, direction, entry_price, tp, sl, now.isoformat()))
         await db.commit()
 
         cursor = await db.execute("SELECT last_insert_rowid()")
-        row = await cursor.fetchone()
-        signal_id = row[0]
+        signal_id = (await cursor.fetchone())[0]
 
     hashtag = f"SIG_{signal_id:04d}"
 
@@ -127,7 +145,7 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     tp_percent = ((tp - entry_price) / entry_price) * 100
     sl_percent = ((sl - entry_price) / entry_price) * 100
 
-    current_time_utc = datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M:%S UTC')
+    current_time_utc = now.strftime('%d.%m.%Y %H:%M:%S UTC')
 
     text = f"""🚨 <b>НОВЫЙ ТОРГОВЫЙ СИГНАЛ #{hashtag}</b>
 
@@ -136,11 +154,9 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
 ──────────────────
 💰 <b>Цена входа:</b> <code>{entry_price:,.2f} USDT</code>
 
-🎯 <b>Take Profit:</b> <code>{tp:,.2f} USDT</code>
-<b>(+{tp_percent:.2f}%)</b>
+🎯 <b>Take Profit:</b> <code>{tp:,.2f} USDT</code> <b>(+{tp_percent:.2f}%)</b>
 
-🛑 <b>Stop Loss:</b> <code>{sl:,.2f} USDT</code>
-<b>({sl_percent:.2f}%)</b>
+🛑 <b>Stop Loss:</b> <code>{sl:,.2f} USDT</code> <b>({sl_percent:.2f}%)</b>
 
 ──────────────────
 🕒 <b>Время сигнала:</b> {current_time_utc}
@@ -151,14 +167,13 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     print(f"✅ Сигнал отправлен → {pair} | {direction} | {entry_price:.2f}")
 
 
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (ЗАЩИЩЁННАЯ) ======================
+# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ ======================
 async def generate_signals():
     print(f"\n🔄 [{datetime.now().strftime('%H:%M:%S')}] Запуск генерации сигналов...")
 
     try:
         for pair in ["BTC/USDT", "ETH/USDT"]:
             try:
-                exchange = ccxt.binance({'enableRateLimit': True})
                 ohlcv = exchange.fetch_ohlcv(pair, '1h', limit=100)
                 df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
                 
@@ -170,7 +185,6 @@ async def generate_signals():
                 price = curr['close']
 
                 if pd.isna(curr.get('sma20')) or pd.isna(curr.get('sma50')):
-                    print(f"   ⚠️  Недостаточно данных для {pair}")
                     continue
 
                 direction = None
@@ -193,14 +207,12 @@ async def generate_signals():
                     print(f"   ❌ Нет сигнала по {pair}")
 
             except Exception as e:
-                logging.error(f"Ошибка при обработке пары {pair}: {e}", exc_info=True)
-                print(f"   ❌ Ошибка при анализе {pair}: {e}")
+                logging.error(f"Ошибка при обработке пары {pair}: {e}")
 
         print(f"✅ Генерация сигналов завершена [{datetime.now().strftime('%H:%M:%S')}]\n")
 
     except Exception as e:
-        logging.error(f"КРИТИЧЕСКАЯ ошибка в generate_signals: {e}", exc_info=True)
-        print(f"💥 Критическая ошибка в генерации: {e}")
+        logging.error(f"Критическая ошибка в generate_signals: {e}", exc_info=True)
 
 
 # ====================== МОНИТОРИНГ TP/SL ======================
@@ -214,7 +226,6 @@ async def monitor_open_signals():
         for row in rows:
             signal_id, pair, direction, tp, sl, hashtag = row
             try:
-                exchange = ccxt.binance({'enableRateLimit': True})
                 ticker = exchange.fetch_ticker(pair)
                 current_price = ticker['last']
 
@@ -228,7 +239,7 @@ async def monitor_open_signals():
                     elif current_price <= sl:
                         status = "closed_sl"
                         closed = True
-                else:
+                else:  # SHORT
                     if current_price <= tp:
                         status = "closed_tp"
                         closed = True
@@ -238,8 +249,10 @@ async def monitor_open_signals():
 
                 if closed:
                     async with aiosqlite.connect(db_path) as db:
-                        await db.execute("UPDATE signals SET status = ?, close_price = ? WHERE id = ?",
-                                         (status, current_price, signal_id))
+                        await db.execute(
+                            "UPDATE signals SET status = ?, close_price = ? WHERE id = ?",
+                            (status, current_price, signal_id)
+                        )
                         await db.commit()
 
                     status_text = "✅ TAKE PROFIT" if status == "closed_tp" else "❌ STOP LOSS"
@@ -250,6 +263,7 @@ async def monitor_open_signals():
 
                     await broadcast_message(text)
                     print(f"📌 Сигнал закрыт: #{hashtag} → {status_text}")
+
             except Exception as e:
                 logging.error(f"Ошибка мониторинга #{hashtag}: {e}")
     except Exception as e:
@@ -329,7 +343,7 @@ async def test_signal(message: types.Message):
     await send_signal("BTC/USDT", "LONG", 65234.5, 66865.0, 63929.8)
 
 
-# ====================== ЗАПУСК (ИСПРАВЛЕННЫЙ) ======================
+# ====================== ЗАПУСК ======================
 async def main():
     await init_db()
 
@@ -338,23 +352,8 @@ async def main():
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
-    scheduler.add_job(
-        generate_signals,
-        trigger="interval",
-        minutes=10,
-        id="generate_signals",
-        replace_existing=True,
-        max_instances=1
-    )
-
-    scheduler.add_job(
-        monitor_open_signals,
-        trigger="interval",
-        minutes=5,
-        id="monitor_open_signals",
-        replace_existing=True,
-        max_instances=1
-    )
+    scheduler.add_job(generate_signals, 'interval', minutes=10, id='generate_signals', replace_existing=True)
+    scheduler.add_job(monitor_open_signals, 'interval', minutes=5, id='monitor_open_signals', replace_existing=True)
 
     scheduler.start()
     print("✅ APScheduler запущен (генерация каждые 10 мин, мониторинг каждые 5 мин)")
@@ -365,9 +364,7 @@ async def main():
     except Exception as e:
         logging.error(f"Ошибка в polling: {e}", exc_info=True)
     finally:
-        print("🛑 Бот завершает работу...")
-        if scheduler.running:
-            scheduler.shutdown(wait=False)
+        scheduler.shutdown(wait=False)
         await bot.session.close()
 
 
