@@ -100,14 +100,14 @@ async def broadcast_message(text: str, parse_mode="HTML"):
 
 
 # ====================== ИСТОРИЯ ======================
-async def get_history(limit: int = 30):
+async def get_history(limit: int = 100):
     async with aiosqlite.connect(db_path) as db:
         return await db.execute_fetchall("""
             SELECT * FROM signals ORDER BY id DESC LIMIT ?
         """, (limit,))
 
 
-# ====================== ОТПРАВКА СИГНАЛА (С ИСПРАВЛЕННЫМ ВРЕМЕНЕМ) ======================
+# ====================== ОТПРАВКА СИГНАЛА (КРАСИВЫЙ ДИЗАЙН) ======================
 async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
     async with aiosqlite.connect(db_path) as db:
         await db.execute('''
@@ -125,17 +125,26 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     emoji = "📈" if direction == "LONG" else "📉"
     direction_text = "LONG ▲" if direction == "LONG" else "SHORT ▼"
 
-    # Время в UTC — теперь будет совпадать с реальным временем сигнала
+    # Расчёт процентов
+    tp_percent = ((tp - entry_price) / entry_price) * 100
+    sl_percent = ((sl - entry_price) / entry_price) * 100
+
     current_time_utc = datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M:%S UTC')
 
     text = f"""🚨 <b>НОВЫЙ ТОРГОВЫЙ СИГНАЛ #{hashtag}</b>
 
 {emoji} <b>{pair}</b> — <b>{direction_text}</b> {emoji}
 
-💰 <b>Цена входа:</b> <code>{entry_price:.2f} USDT</code>
-🎯 <b>Take Profit:</b> <code>{tp:.2f} USDT</code>
-🛑 <b>Stop Loss:</b> <code>{sl:.2f} USDT</code>
+──────────────────
+💰 <b>Цена входа:</b> <code>{entry_price:,.2f} USDT</code>
 
+🎯 <b>Take Profit:</b> <code>{tp:,.2f} USDT</code>
+<b>(+{tp_percent:.2f}%)</b>
+
+🛑 <b>Stop Loss:</b> <code>{sl:,.2f} USDT</code>
+<b>({sl_percent:.2f}%)</b>
+
+──────────────────
 🕒 <b>Время сигнала:</b> {current_time_utc}
 
 🔍 <b>#{hashtag}</b>"""
@@ -233,7 +242,7 @@ async def monitor_open_signals():
                 text = f"""📢 <b>Сигнал закрыт #{hashtag}</b>
 
 {status_text}
-Цена закрытия: <b>{current_price:.2f} USDT</b>"""
+Цена закрытия: <b>{current_price:,.2f} USDT</b>"""
 
                 await broadcast_message(text)
                 print(f"📌 Сигнал закрыт: #{hashtag} → {status_text}")
@@ -268,7 +277,7 @@ async def show_history(message: types.Message):
         await message.answer("📭 Пока нет сигналов.")
         return
 
-    text = "📜 <b>История сигналов</b>\n\n"
+    text = f"📜 <b>История сигналов</b> (последние {len(history)})\n\n"
     for row in history:
         _, pair, direction, entry, tp, sl, ts, status, close_p, hashtag = row
         emoji = "📈" if direction == "LONG" else "📉"
@@ -281,6 +290,10 @@ async def show_history(message: types.Message):
             line += f"Статус: {st}\n"
         line += f"Время: {ts[:16]}\n\n"
         text += line
+
+    if len(history) >= 100:
+        text += "⚠️ Показаны только последние 100 сигналов."
+
     await message.answer(text, parse_mode="HTML")
 
 
