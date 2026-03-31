@@ -1,7 +1,7 @@
 aiogram
-aiosqlite
-apscheduler
-pandas
 ccxt
+aiosqlite
+pandas
+pandas-ta
+apscheduler
 python-dotenv
-aiohttp-socks
