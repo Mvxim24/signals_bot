@@ -33,12 +33,10 @@ if not TOKEN:
 
 db_path = "signals.db"
 
-# Настройка сессии бота
 session = AiohttpSession()
 bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher()
 
-# Глобальный scheduler (чтобы можно было gracefully shutdown)
 scheduler = AsyncIOScheduler(timezone="UTC")
 
 
@@ -101,6 +99,15 @@ async def broadcast_message(text: str, parse_mode="HTML"):
             logging.error(f"Ошибка отправки пользователю {user_id}: {e}")
 
 
+# ====================== ИСТОРИЯ СИГНАЛОВ ======================
+async def get_history(limit: int = 30):
+    """Получить последние сигналы"""
+    async with aiosqlite.connect(db_path) as db:
+        return await db.execute_fetchall("""
+            SELECT * FROM signals ORDER BY id DESC LIMIT ?
+        """, (limit,))
+
+
 # ====================== ОТПРАВКА СИГНАЛА ======================
 async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
     async with aiosqlite.connect(db_path) as db:
@@ -142,18 +149,21 @@ async def generate_signals():
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute("SELECT COUNT(*) FROM signals WHERE timestamp LIKE ?", (f"{today_str}%",))
         row = await cursor.fetchone()
-        if row[0] >= 3:
+        if row and row[0] >= 3:
             return
 
     for pair in ["BTC/USDT", "ETH/USDT"]:
-        async with aiosqlite.connect(db_path) as db:
-            cursor = await db.execute("SELECT timestamp FROM signals WHERE pair = ? ORDER BY id DESC LIMIT 1", (pair,))
-            last = await cursor.fetchone()
-
-        if last and (datetime.now() - datetime.fromisoformat(last[0])).total_seconds() < 14400:
-            continue
-
         try:
+            async with aiosqlite.connect(db_path) as db:
+                cursor = await db.execute(
+                    "SELECT timestamp FROM signals WHERE pair = ? ORDER BY id DESC LIMIT 1", 
+                    (pair,)
+                )
+                last = await cursor.fetchone()
+
+            if last and (datetime.now() - datetime.fromisoformat(last[0])).total_seconds() < 14400:
+                continue
+
             exchange = ccxt.binance({'enableRateLimit': True})
             ohlcv = exchange.fetch_ohlcv(pair, '1h', limit=100)
             df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
@@ -179,6 +189,7 @@ async def generate_signals():
 
             if direction:
                 await send_signal(pair, direction, price, tp, sl)
+
         except Exception as e:
             logging.error(f"Ошибка генерации {pair}: {e}")
 
@@ -249,7 +260,7 @@ async def start_cmd(message: types.Message):
 
 @dp.message(F.text == "📜 История сигналов")
 async def show_history(message: types.Message):
-    history = await get_history()
+    history = await get_history()          # ← теперь функция определена
     if not history:
         await message.answer("Пока нет сигналов.")
         return
@@ -301,7 +312,6 @@ async def test_signal(message: types.Message):
 async def main():
     await init_db()
 
-    # Настройка логирования (лучше делать в самом начале)
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -327,14 +337,12 @@ async def main():
     )
 
     scheduler.start()
-    print("✅ APScheduler запущен (generate_signals каждые 30 мин, monitor каждые 5 мин)")
-
+    print("✅ APScheduler запущен")
     print("🚀 Бот успешно запущен! Напиши ему /start в Telegram.")
 
     try:
         await dp.start_polling(bot)
     finally:
-        # Корректное завершение
         if scheduler.running:
             scheduler.shutdown(wait=False)
         await bot.session.close()
