@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from collections import defaultdict
 
 import pandas as pd
@@ -146,7 +146,7 @@ async def generate_signals():
         pairs = ["BTC/USDT", "ETH/USDT"]
         for pair in pairs:
             try:
-                ohlcv = exchange.fetch_ohlcv(pair, '15m', limit=100)   # ← Изменено на 15m
+                ohlcv = exchange.fetch_ohlcv(pair, '15m', limit=100)
                 df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
                 df['sma20'] = df['close'].rolling(20).mean()
                 df['sma50'] = df['close'].rolling(50).mean()
@@ -163,7 +163,7 @@ async def generate_signals():
                 if curr['sma20'] > curr['sma50'] and prev['sma20'] <= prev['sma50']:
                     direction = "LONG"
                     sl = round(price * 0.985, 2)
-                    tp = round(price * 1.025, 2)      # чуть меньше TP на 15m
+                    tp = round(price * 1.025, 2)
                 elif curr['sma20'] < curr['sma50'] and prev['sma20'] >= prev['sma50']:
                     direction = "SHORT"
                     sl = round(price * 1.015, 2)
@@ -177,9 +177,8 @@ async def generate_signals():
         is_generating = False
 
 
-# ====================== МОНИТОРИНГ ======================
+# ====================== МОНИТОРИНГ TP/SL ======================
 async def monitor_open_signals():
-    # (оставил без изменений, можешь скопировать из предыдущей версии)
     try:
         async with aiosqlite.connect(db_path) as db:
             rows = await db.execute_fetchall("""
@@ -196,16 +195,26 @@ async def monitor_open_signals():
                 status = None
 
                 if direction == "LONG":
-                    if current_price >= tp: status = "closed_tp"; closed = True
-                    elif current_price <= sl: status = "closed_sl"; closed = True
+                    if current_price >= tp:
+                        status = "closed_tp"
+                        closed = True
+                    elif current_price <= sl:
+                        status = "closed_sl"
+                        closed = True
                 else:
-                    if current_price <= tp: status = "closed_tp"; closed = True
-                    elif current_price >= sl: status = "closed_sl"; closed = True
+                    if current_price <= tp:
+                        status = "closed_tp"
+                        closed = True
+                    elif current_price >= sl:
+                        status = "closed_sl"
+                        closed = True
 
                 if closed:
                     async with aiosqlite.connect(db_path) as db:
-                        await db.execute("UPDATE signals SET status = ?, close_price = ? WHERE id = ?",
-                                         (status, current_price, signal_id))
+                        await db.execute(
+                            "UPDATE signals SET status = ?, close_price = ? WHERE id = ?",
+                            (status, current_price, signal_id)
+                        )
                         await db.commit()
 
                     status_text = "✅ TAKE PROFIT" if status == "closed_tp" else "❌ STOP LOSS"
@@ -217,10 +226,10 @@ async def monitor_open_signals():
             except Exception as e:
                 logging.error(f"Ошибка мониторинга {hashtag}: {e}")
     except Exception as e:
-        logging.error(f"Ошибка monitor: {e}")
+        logging.error(f"Ошибка monitor_open_signals: {e}")
 
 
-# ====================== ХЭНДЛЕР START ======================
+# ====================== ХЭНДЛЕРЫ ======================
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await add_subscriber(message.from_user)
@@ -236,12 +245,61 @@ async def start_cmd(message: types.Message):
         "🤖 Бот использует стратегию пересечения скользящих средних "
         "<b>SMA 20 и SMA 50</b> на 15-минутном таймфрейме.\n\n"
         "Сигналы приходят автоматически.",
-        parse_mode="HTML", 
+        parse_mode="HTML",
         reply_markup=kb
     )
 
 
-# Остальные хендлеры (история, отписка и т.д.) оставь как были
+@dp.message(F.text == "📜 История сигналов")
+async def show_history(message: types.Message):
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            history = await db.execute_fetchall("""
+                SELECT * FROM signals ORDER BY id DESC LIMIT 20
+            """)
+
+        if not history:
+            await message.answer("📭 Пока нет сигналов.\n\nКак только появится первый сигнал — он сразу отобразится здесь.")
+            return
+
+        text = "📜 <b>История сигналов (последние 20)</b>\n\n"
+        for row in history:
+            _, pair, direction, entry, tp, sl, ts, status, close_p, hashtag = row
+            emoji = "📈" if direction == "LONG" else "📉"
+            st = "✅ TAKE PROFIT" if status == "closed_tp" else "❌ STOP LOSS" if status == "closed_sl" else "⏳ Открыт"
+            
+            line = f"<b>#{hashtag}</b> {pair} {direction} {emoji}\n"
+            line += f"Вход: <code>{entry:,.2f}</code>\n"
+            if close_p:
+                line += f"Закрыто: <code>{close_p:,.2f}</code> — {st}\n"
+            else:
+                line += f"Статус: {st}\n"
+            line += f"Время: {ts[:16]}\n\n"
+            text += line
+
+        await message.answer(text, parse_mode="HTML")
+
+    except Exception as e:
+        logging.error(f"Ошибка в show_history: {e}")
+        await message.answer("❌ Не удалось загрузить историю. Попробуйте позже.")
+
+
+@dp.message(F.text == "❌ Отписаться")
+async def unsubscribe(message: types.Message):
+    await remove_subscriber(message.from_user.id)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ Подписаться")]], resize_keyboard=True)
+    await message.answer("❌ Вы отписались от сигналов.", reply_markup=kb)
+
+
+@dp.message(F.text == "✅ Подписаться")
+async def subscribe_again(message: types.Message):
+    await add_subscriber(message.from_user)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📜 История сигналов")], [KeyboardButton(text="❌ Отписаться")]],
+        resize_keyboard=True
+    )
+    await message.answer("✅ Подписка успешно активирована!", reply_markup=kb)
+
 
 # ====================== ЗАПУСК ======================
 async def main():
@@ -252,7 +310,7 @@ async def main():
     scheduler.add_job(monitor_open_signals, 'interval', seconds=30, replace_existing=True)
 
     scheduler.start()
-    print("🚀 Бот запущен | Стратегия: SMA 20/50 на 15m")
+    print("🚀 Бот успешно запущен | SMA 20/50 на 15m таймфрейме")
 
     try:
         await dp.start_polling(bot)
