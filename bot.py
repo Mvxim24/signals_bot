@@ -95,7 +95,6 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     key = f"{pair}_{direction}"
     now = datetime.now(timezone.utc)
 
-    # Усиленная защита — 45 минут между одинаковыми сигналами
     if (now - last_signal_time[key]).total_seconds() < 2700:   # 45 минут
         return
     last_signal_time[key] = now
@@ -139,7 +138,7 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     print(f"✅ Сигнал отправлен → {pair} | {direction}")
 
 
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ ======================
+# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (30m) ======================
 async def generate_signals():
     global is_generating
     if is_generating:
@@ -150,13 +149,17 @@ async def generate_signals():
         pairs = ["BTC/USDT", "ETH/USDT"]
         for pair in pairs:
             try:
-                ohlcv = exchange.fetch_ohlcv(pair, '1h', limit=100)
+                # 30-минутный таймфрейм
+                ohlcv = exchange.fetch_ohlcv(pair, '30m', limit=200)
                 df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+                
                 df['sma20'] = df['close'].rolling(20).mean()
                 df['sma50'] = df['close'].rolling(50).mean()
 
-                curr = df.iloc[-1]
-                prev = df.iloc[-2]
+                # Используем только закрытые свечи
+                prev = df.iloc[-2]   # предыдущая закрытая свеча
+                curr = df.iloc[-1]   # текущая закрытая свеча (последняя завершённая)
+
                 price = float(curr['close'])
 
                 if pd.isna(curr.get('sma20')) or pd.isna(curr.get('sma50')):
@@ -164,6 +167,7 @@ async def generate_signals():
 
                 direction = sl = tp = None
 
+                # Кроссовер на закрытой свече
                 if curr['sma20'] > curr['sma50'] and prev['sma20'] <= prev['sma50']:
                     direction = "LONG"
                     sl = round(price * 0.985, 2)
@@ -235,7 +239,7 @@ async def monitor_open_signals():
         logging.error(f"Ошибка monitor_open_signals: {e}")
 
 
-# ====================== ХЭНДЛЕРЫ (оставил твои) ======================
+# ====================== ХЭНДЛЕРЫ ======================
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await add_subscriber(message.from_user)
@@ -245,7 +249,7 @@ async def start_cmd(message: types.Message):
     )
     await message.answer(
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-        "🤖 Бот анализирует MEXC и присылает сигналы.", 
+        "🤖 Бот анализирует MEXC по 30-минутному таймфрейму.", 
         parse_mode="HTML", reply_markup=kb
     )
 
@@ -289,12 +293,12 @@ async def main():
     await init_db()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    scheduler.add_job(generate_signals, 'interval', seconds=20, replace_existing=True)   # ← Улучшено
+    scheduler.add_job(generate_signals, 'interval', seconds=60, replace_existing=True)
     scheduler.add_job(monitor_open_signals, 'interval', seconds=30, replace_existing=True)
 
     scheduler.start()
-    print("🚀 Бот запущен на MEXC")
-    print("   • Генерация сигналов — каждые 20 секунд")
+    print("🚀 Бот запущен на MEXC (30m таймфрейм)")
+    print("   • Генерация сигналов — каждые 60 секунд")
     print("   • Мониторинг TP/SL — каждые 30 секунд")
     print("   • Защита от дублей — 45 минут")
 
