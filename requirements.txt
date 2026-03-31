@@ -3,3 +3,4 @@ ccxt
 pandas
 aiosqlite
 python-dotenv
+apscheduler
