@@ -31,7 +31,7 @@ exchange = ccxt.mexc({'enableRateLimit': True})
 
 last_signal_time = defaultdict(lambda: datetime(2000, 1, 1, tzinfo=timezone.utc))
 is_generating = False
-generate_lock = asyncio.Lock()          # ← Новая защита
+generate_lock = asyncio.Lock()
 
 scheduler = AsyncIOScheduler(timezone="UTC")
 
@@ -160,19 +160,30 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     print(f"✅ Сигнал отправлен → {pair} | {direction} | Entry: {entry_price}")
 
 
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ — ВАРИАНТ 1 ======================
+# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (с R:R 1:1.5 и блокировкой открытых позиций) ======================
 async def generate_signals():
     global is_generating
     if is_generating:
         return
 
-    async with generate_lock:                 # ← Надёжная защита
+    async with generate_lock:
         is_generating = True
         try:
             pairs = ["BTC/USDT", "ETH/USDT"]
 
+            # Получаем все пары, по которым уже есть открытые сигналы
+            async with aiosqlite.connect(db_path) as db:
+                open_rows = await db.execute_fetchall("""
+                    SELECT pair FROM signals WHERE status = 'open'
+                """)
+                open_pairs = {row[0] for row in open_rows}
+
             for pair in pairs:
                 try:
+                    # Не открываем новую позицию, если по этой паре уже есть открытый сигнал
+                    if pair in open_pairs:
+                        continue
+
                     ohlcv = exchange.fetch_ohlcv(pair, '15m', limit=300)
                     df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
 
@@ -192,20 +203,20 @@ async def generate_signals():
                     direction = None
                     sl = tp = None
 
-                    # === Логика Вариант 1 ===
+                    # === Логика Вариант 1 + R:R 1:1.5 ===
                     if curr['sma20'] > curr['sma50']:          # Восходящий тренд
                         if prev['close'] <= prev['sma20'] and curr['close'] > curr['sma20']:
                             if vol > vol_ma * 0.8:             # Фильтр по объёму
                                 direction = "LONG"
-                                sl = round_price(price * 0.985, get_tick_size(pair))
-                                tp = round_price(price * 1.035, get_tick_size(pair))   # чуть шире TP
+                                sl = round_price(price * 0.985, get_tick_size(pair))   # -1.5%
+                                tp = round_price(price * 1.0225, get_tick_size(pair))  # +2.25%
 
                     elif curr['sma20'] < curr['sma50']:        # Нисходящий тренд
                         if prev['close'] >= prev['sma20'] and curr['close'] < curr['sma20']:
                             if vol > vol_ma * 0.8:
                                 direction = "SHORT"
-                                sl = round_price(price * 1.015, get_tick_size(pair))
-                                tp = round_price(price * 0.965, get_tick_size(pair))
+                                sl = round_price(price * 1.015, get_tick_size(pair))   # -1.5%
+                                tp = round_price(price * 0.9775, get_tick_size(pair))  # +2.25%
 
                     if direction:
                         await send_signal(pair, direction, price, tp, sl)
@@ -217,7 +228,7 @@ async def generate_signals():
             is_generating = False
 
 
-# ====================== МОНИТОРИНГ TP/SL (улучшенный) ======================
+# ====================== МОНИТОРИНГ TP/SL ======================
 async def monitor_open_signals():
     try:
         async with aiosqlite.connect(db_path) as db:
@@ -354,7 +365,7 @@ async def main():
     scheduler.add_job(monitor_open_signals, 'interval', seconds=25, replace_existing=True)
 
     scheduler.start()
-    print("🚀 Бот успешно запущен | Стратегия: SMA20/50 + Pullback (15m)")
+    print("🚀 Бот успешно запущен | Стратегия: SMA20/50 + Pullback | R:R 1:1.5")
 
     try:
         await dp.start_polling(bot)
