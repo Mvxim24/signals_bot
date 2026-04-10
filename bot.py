@@ -24,10 +24,19 @@ if not TOKEN:
 
 db_path = "signals.db"
 
-bot = Bot(token=TOKEN, session=AiohttpSession())
+# ====================== ИНИЦИАЛИЗАЦИЯ ======================
+bot = Bot(
+    token=TOKEN,
+    session=AiohttpSession()
+)
 dp = Dispatcher()
 
-exchange = ccxt.mexc({'enableRateLimit': True})
+# Настраиваем биржу с таймаутами
+exchange = ccxt.mexc({
+    'enableRateLimit': True,
+    'timeout': 15000,          # 15 секунд
+    'options': {'defaultType': 'spot'}
+})
 
 last_signal_time = defaultdict(lambda: datetime(2000, 1, 1, tzinfo=timezone.utc))
 is_generating = False
@@ -95,12 +104,11 @@ async def broadcast_message(text: str):
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 def get_tick_size(symbol: str) -> float:
-    """Получаем минимальный шаг цены для корректного округления"""
     try:
         markets = exchange.load_markets()
         return float(markets[symbol]['precision']['price'])
     except:
-        return 0.01  # fallback
+        return 0.01
 
 
 def round_price(price: float, tick_size: float) -> float:
@@ -160,7 +168,7 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     print(f"✅ Сигнал отправлен → {pair} | {direction} | Entry: {entry_price}")
 
 
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (с R:R 1:1.5 и блокировкой открытых позиций) ======================
+# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ ======================
 async def generate_signals():
     global is_generating
     if is_generating:
@@ -171,16 +179,12 @@ async def generate_signals():
         try:
             pairs = ["BTC/USDT", "ETH/USDT"]
 
-            # Получаем все пары, по которым уже есть открытые сигналы
             async with aiosqlite.connect(db_path) as db:
-                open_rows = await db.execute_fetchall("""
-                    SELECT pair FROM signals WHERE status = 'open'
-                """)
+                open_rows = await db.execute_fetchall("SELECT pair FROM signals WHERE status = 'open'")
                 open_pairs = {row[0] for row in open_rows}
 
             for pair in pairs:
                 try:
-                    # Не открываем новую позицию, если по этой паре уже есть открытый сигнал
                     if pair in open_pairs:
                         continue
 
@@ -203,20 +207,19 @@ async def generate_signals():
                     direction = None
                     sl = tp = None
 
-                    # === Логика Вариант 1 + R:R 1:1.5 ===
-                    if curr['sma20'] > curr['sma50']:          # Восходящий тренд
+                    if curr['sma20'] > curr['sma50']:
                         if prev['close'] <= prev['sma20'] and curr['close'] > curr['sma20']:
-                            if vol > vol_ma * 0.8:             # Фильтр по объёму
+                            if vol > vol_ma * 0.8:
                                 direction = "LONG"
-                                sl = round_price(price * 0.985, get_tick_size(pair))   # -1.5%
-                                tp = round_price(price * 1.0225, get_tick_size(pair))  # +2.25%
+                                sl = round_price(price * 0.985, get_tick_size(pair))
+                                tp = round_price(price * 1.0225, get_tick_size(pair))
 
-                    elif curr['sma20'] < curr['sma50']:        # Нисходящий тренд
+                    elif curr['sma20'] < curr['sma50']:
                         if prev['close'] >= prev['sma20'] and curr['close'] < curr['sma20']:
                             if vol > vol_ma * 0.8:
                                 direction = "SHORT"
-                                sl = round_price(price * 1.015, get_tick_size(pair))   # -1.5%
-                                tp = round_price(price * 0.9775, get_tick_size(pair))  # +2.25%
+                                sl = round_price(price * 1.015, get_tick_size(pair))
+                                tp = round_price(price * 0.9775, get_tick_size(pair))
 
                     if direction:
                         await send_signal(pair, direction, price, tp, sl)
@@ -228,7 +231,7 @@ async def generate_signals():
             is_generating = False
 
 
-# ====================== МОНИТОРИНГ TP/SL ======================
+# ====================== МОНИТОРИНГ TP/SL (улучшенный) ======================
 async def monitor_open_signals():
     try:
         async with aiosqlite.connect(db_path) as db:
@@ -243,21 +246,26 @@ async def monitor_open_signals():
                 ticker = exchange.fetch_ticker(pair)
                 current_price = float(ticker['last'])
 
+                # Дополнительно проверяем последнюю минуту
+                ohlcv = exchange.fetch_ohlcv(pair, '1m', limit=3)
+                recent_high = max(float(c[2]) for c in ohlcv)
+                recent_low = min(float(c[3]) for c in ohlcv)
+
                 closed = False
                 status = None
 
                 if direction == "LONG":
-                    if current_price >= tp:
+                    if current_price >= tp or recent_high >= tp:
                         status = "closed_tp"
                         closed = True
-                    elif current_price <= sl:
+                    elif current_price <= sl or recent_low <= sl:
                         status = "closed_sl"
                         closed = True
                 else:  # SHORT
-                    if current_price <= tp:
+                    if current_price <= tp or recent_low <= tp:
                         status = "closed_tp"
                         closed = True
-                    elif current_price >= sl:
+                    elif current_price >= sl or recent_high >= sl:
                         status = "closed_sl"
                         closed = True
 
@@ -277,12 +285,13 @@ async def monitor_open_signals():
 Вход был: <b>{entry:,.2f} USDT</b>"""
 
                     await broadcast_message(text)
-                    print(f"✅ Сигнал закрыт → #{hashtag} | {status}")
+                    print(f"✅ Сигнал закрыт → #{hashtag} | {status} | Price: {current_price:.2f}")
 
             except Exception as e:
-                logging.error(f"Ошибка мониторинга {hashtag}: {e}")
+                logging.error(f"Ошибка мониторинга {hashtag} ({pair}): {e}")
+
     except Exception as e:
-        logging.error(f"Ошибка monitor_open_signals: {e}")
+        logging.error(f"Критическая ошибка monitor_open_signals: {e}")
 
 
 # ====================== ХЭНДЛЕРЫ ======================
@@ -305,6 +314,7 @@ async def start_cmd(message: types.Message):
     )
 
 
+# (Остальные хэндлеры оставлены без изменений)
 @dp.message(F.text == "📜 История сигналов")
 async def show_history(message: types.Message):
     try:
@@ -359,19 +369,30 @@ async def subscribe_again(message: types.Message):
 # ====================== ЗАПУСК ======================
 async def main():
     await init_db()
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
 
-    scheduler.add_job(generate_signals, 'interval', seconds=20, replace_existing=True)
-    scheduler.add_job(monitor_open_signals, 'interval', seconds=25, replace_existing=True)
+    scheduler.add_job(generate_signals, 'interval', seconds=30, replace_existing=True)
+    scheduler.add_job(monitor_open_signals, 'interval', seconds=40, replace_existing=True)
 
     scheduler.start()
-    print("🚀 Бот успешно запущен | Стратегия: SMA20/50 + Pullback | R:R 1:1.5")
+    print("🚀 Бот успешно запущен | Стабильная версия | R:R 1:1.5")
 
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(
+            bot,
+            timeout=35,
+            long_polling_timeout=40,
+            drop_pending_updates=True,
+            allowed_updates=["message"]
+        )
     finally:
+        print("🛑 Бот завершает работу...")
         scheduler.shutdown()
         await bot.session.close()
+        await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
