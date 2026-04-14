@@ -154,7 +154,7 @@ async def generate_signals():
     async with generate_lock:
         is_generating = True
         try:
-            pairs = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
+            pairs = ["BTC/USDT", "ETH/USDT"]
             async with aiosqlite.connect(db_path) as db:
                 async with db.execute("SELECT pair FROM signals WHERE status = 'open'") as cursor:
                     open_pairs = {row[0] for row in await cursor.fetchall()}
